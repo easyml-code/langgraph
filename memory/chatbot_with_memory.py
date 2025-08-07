@@ -8,3 +8,5 @@ llm = ChatGroq(model="llama3-70b-8192")
 response = llm.invoke("What is the capital of France?")
 
 print(response)
+
+
