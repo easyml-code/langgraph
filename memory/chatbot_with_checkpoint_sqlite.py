@@ -1,17 +1,22 @@
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langgraph.graph import START, END, StateGraph, add_messages
+from langgraph.checkpoint.sqlite import SqliteSaver
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Annotated
+import sqlite3
 
 load_dotenv()
+# Memory database setup
+checkpoint_db = "chatbot_memory.db"
+conn = sqlite3.connect(checkpoint_db, check_same_thread = False)
+memory = SqliteSaver(conn)
 
 # Define the state
 class ChatState(BaseModel):
     messages: Annotated[list[BaseMessage], add_messages]
 
-# llm = ChatGroq(model="llama3-70b-8192")
 llm = ChatGroq(model="openai/gpt-oss-20b")
 
 # Define a simple state graph
@@ -29,11 +34,15 @@ graph.add_node(chat_node, "chat_node")
 graph.add_edge(START, "chat_node")
 graph.add_edge("chat_node", END)
 
-app = graph.compile()
+app = graph.compile(checkpointer=memory)
 
 conversation_state = ChatState(messages=[
     SystemMessage(content="You are a helpful assistant.")
 ])
+
+config = {"configurable":{
+    "thread_id": "1"
+}}
 
 # Chatbot start
 while True:
@@ -42,11 +51,6 @@ while True:
         print("Exiting the chatbot.")
         break
     
-    # Create initial state with user message
-    conversation_state.messages.append(HumanMessage(content=user_input))
+    response = app.invoke({"messages": HumanMessage(user_input)}, config=config)
     
-    response_state = app.invoke(conversation_state)
-    conversation_state = ChatState(**response_state)
-
-    last_message = conversation_state.messages[-1]
-    print(f"AI: {last_message.content}")
+    print(f"AI: {response['messages'][-1].content}")
