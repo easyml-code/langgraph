@@ -1,0 +1,252 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain.tools import BaseTool
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from typing import Dict, Any, Optional
+from pydantic import BaseModel, Field
+import json
+
+class MCPTool(BaseTool):
+    """Custom LangChain tool that wraps MCP server tools"""
+    
+    session: Any = Field(exclude=True)  # MCP session
+    mcp_tool_name: str
+    
+    class Config:
+        arbitrary_types_allowed = True
+    
+    def _run(self, **kwargs) -> str:
+        """This won't be used since we override _acall"""
+        raise NotImplementedError("This tool only supports async calls")
+    
+    async def _arun(self, **kwargs) -> str:
+        """Execute the MCP tool asynchronously"""
+        try:
+            result = await self.session.call_tool(self.mcp_tool_name, kwargs)
+            return str(result.content[0].text) if result.content else "No result"
+        except Exception as e:
+            return f"Error calling {self.mcp_tool_name}: {str(e)}"
+
+async def create_mcp_tools():
+    """Create MCP tools and return them as LangChain tools"""
+    
+    # Define server configurations
+    servers = {
+        "playwright": StdioServerParameters(
+            command="npx",
+            args=["@playwright/mcp@latest"],
+            env={"DISPLAY": ":1"}
+        ),
+        "airbnb": StdioServerParameters(
+            command="npx", 
+            args=["-y", "@openbnb/mcp-server-airbnb"]
+        )
+    }
+    
+    # Connect to MCP servers
+    sessions = {}
+    langchain_tools = []
+    
+    for name, server_params in servers.items():
+        try:
+            print(f"🔌 Connecting to {name} server...")
+            
+            # Properly use the async context manager
+            async with stdio_client(server_params) as (read, write):
+                session = ClientSession(read, write)
+                await session.initialize()
+                
+                # Store session for later use (this is a simplified approach)
+                sessions[name] = session
+                print(f"✅ Connected to {name} server")
+                
+                # Get tools from this server
+                tools_result = await session.list_tools()
+                for tool in tools_result.tools:
+                    # Create LangChain tool wrapper
+                    mcp_tool = MCPTool(
+                        name=f"{name}_{tool.name}",
+                        description=tool.description or f"Tool from {name} server: {tool.name}",
+                        session=session,
+                        mcp_tool_name=tool.name
+                    )
+                    langchain_tools.append(mcp_tool)
+                    print(f"📦 Created LangChain tool: {mcp_tool.name}")
+                
+        except Exception as e:
+            print(f"❌ Failed to connect to {name}: {e}")
+            # Let's try a different approach for this server
+            continue
+    
+    return langchain_tools, sessions
+
+# Alternative approach using direct connection
+async def create_mcp_tools_alternative():
+    """Alternative approach to create MCP tools"""
+    
+    langchain_tools = []
+    sessions = {}
+    
+    # Try connecting to servers one by one
+    server_configs = [
+        {
+            "name": "airbnb",
+            "command": "npx",
+            "args": ["-y", "@openbnb/mcp-server-airbnb"]
+        },
+        {
+            "name": "playwright", 
+            "command": "npx",
+            "args": ["@playwright/mcp@latest"],
+            "env": {"DISPLAY": ":1"}
+        }
+    ]
+    
+    for config in server_configs:
+        try:
+            name = config["name"]
+            print(f"🔌 Attempting to connect to {name}...")
+            
+            # Create server parameters
+            server_params = StdioServerParameters(
+                command=config["command"],
+                args=config["args"],
+                env=config.get("env", {})
+            )
+            
+            # Create a persistent connection
+            client_context = stdio_client(server_params)
+            read, write = await client_context.__aenter__()
+            
+            session = ClientSession(read, write)
+            await session.initialize()
+            
+            sessions[name] = {
+                "session": session,
+                "context": client_context
+            }
+            
+            print(f"✅ Successfully connected to {name}")
+            
+            # Get available tools
+            try:
+                tools_result = await session.list_tools()
+                print(f"📋 Found {len(tools_result.tools)} tools in {name}")
+                
+                for tool in tools_result.tools:
+                    mcp_tool = MCPTool(
+                        name=f"{name}_{tool.name}",
+                        description=tool.description or f"Tool: {tool.name} from {name}",
+                        session=session,
+                        mcp_tool_name=tool.name
+                    )
+                    langchain_tools.append(mcp_tool)
+                    print(f"  📦 {tool.name}: {tool.description}")
+                    
+            except Exception as e:
+                print(f"⚠️  Could not get tools from {name}: {e}")
+                
+        except Exception as e:
+            print(f"❌ Failed to connect to {config['name']}: {e}")
+            continue
+    
+    return langchain_tools, sessions
+
+async def main():
+    # Load environment variables
+    load_dotenv()
+    
+    # Check for required API key
+    if not os.getenv("GROQ_API_KEY"):
+        print("❌ GROQ_API_KEY not found in environment variables")
+        return
+    
+    # Initialize Groq LLM
+    llm = ChatGroq(
+        model="llama-3.1-70b-versatile",  # or your preferred model
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0.1
+    )
+    
+    # Create MCP tools
+    print("🔧 Setting up MCP tools...")
+    
+    # Try the alternative approach
+    tools, sessions = await create_mcp_tools_alternative()
+    
+    if not tools:
+        print("❌ No tools available. Let's check what's installed...")
+        
+        # Check if required packages are available
+        import subprocess
+        try:
+            result = subprocess.run(["npx", "--version"], capture_output=True, text=True)
+            print(f"NPX version: {result.stdout.strip()}")
+        except Exception as e:
+            print(f"❌ NPX not available: {e}")
+            return
+        
+        print("💡 Try running these commands first:")
+        print("   npm install -g @playwright/mcp")
+        print("   npm install -g @openbnb/mcp-server-airbnb")
+        return
+    
+    print(f"🎉 Successfully created {len(tools)} tools!")
+    
+    # Create agent prompt
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an AI assistant with access to web automation and Airbnb booking tools.
+        
+        Available capabilities:
+        - Airbnb tools: Search and interact with Airbnb listings
+        - Playwright tools: Web automation and browser interactions
+        
+        When helping users with Airbnb bookings:
+        1. First search for properties matching their criteria
+        2. Then proceed with booking steps if they want to book
+        
+        Be systematic and explain what you're doing at each step.
+        If a tool fails, try alternative approaches or explain the limitation."""),
+        ("user", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    
+    # Create the agent
+    agent = create_openai_tools_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        max_iterations=15,
+        handle_parsing_errors=True
+    )
+    
+    # Run the query
+    user_query = "Please book **Cozy Downtown Loft** at san francisco for 2 days 15 aug and 16 aug"
+    
+    print(f"\n🚀 Starting task: {user_query}\n")
+    
+    try:
+        result = await agent_executor.ainvoke({"input": user_query})
+        print(f"\n🎯 Final Result: {result['output']}")
+    except Exception as e:
+        print(f"💥 Error during execution: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Clean up connections
+    print("\n🧹 Cleaning up connections...")
+    for name, session_data in sessions.items():
+        try:
+            await session_data["context"].__aexit__(None, None, None)
+            print(f"🔌 Closed {name} connection")
+        except Exception as e:
+            print(f"⚠️  Error closing {name}: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
